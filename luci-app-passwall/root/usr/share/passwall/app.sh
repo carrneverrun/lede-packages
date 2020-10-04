@@ -218,12 +218,12 @@ ln_start_bin() {
 	shift 2;
 	if [  "${file_func%%/*}" != "${file_func}" ]; then
 		[ ! -L "${file_func}" ] && {
-			ln -s "${file_func}" "${TMP_BIN_PATH}/${ln_name}"
+			ln -s "${file_func}" "${TMP_BIN_PATH}/${ln_name}" >/dev/null 2>&1
 			file_func="${TMP_BIN_PATH}/${ln_name}"
 		}
 		[ -x "${file_func}" ] || echolog "  - $(readlink ${file_func}) 没有执行权限，无法启动：${file_func} $*"
 	fi
-	echo "${file_func} $*" >&2
+	#echo "${file_func} $*" >&2
 	[ -n "${file_func}" ] || echolog "  - 找不到 ${ln_name}，无法启动..."
 	${file_func:-echolog "  - ${ln_name}"} "$@" >/dev/null 2>&1 &
 }
@@ -310,10 +310,16 @@ run_socks() {
 	local bind=$2
 	local local_port=$3
 	local config_file=$4
+	local relay_port=$6
 	local type=$(echo $(config_n_get $node type) | tr 'A-Z' 'a-z')
 	local remarks=$(config_n_get $node remarks)
 	local server_host=$(config_n_get $node address)
 	local port=$(config_n_get $node port)
+	[ -n "$relay_port" ] && {
+		server_host="127.0.0.1"
+		port=$relay_port
+		echo $relay_port
+	}
 	local msg tmp
 
 	if [ -n "$server_host" ] && [ -n "$port" ]; then
@@ -347,15 +353,15 @@ run_socks() {
 		ln_start_bin "$(first_type $(config_t_get global_app v2ray_file notset)/v2ray v2ray)" v2ray -config="$config_file"
 	;;
 	trojan-go)
-		lua $API_GEN_TROJAN $node client $bind $local_port > $config_file
+		lua $API_GEN_TROJAN $node client $bind $local_port $port > $config_file
 		ln_start_bin "$(first_type $(config_t_get global_app trojan_go_file notset) trojan-go)" trojan-go -config "$config_file"
 	;;
 	trojan*)
-		lua $API_GEN_TROJAN $node client $bind $local_port > $config_file
+		lua $API_GEN_TROJAN $node client $bind $local_port $port > $config_file
 		ln_start_bin "$(first_type ${type})" "${type}" -c "$config_file"
 	;;
 	naiveproxy)
-		lua $API_GEN_NAIVE $node socks $bind $local_port > $config_file
+		lua $API_GEN_NAIVE $node socks $bind $local_port $port > $config_file
 		ln_start_bin "$(first_type naive)" naive "$config_file"
 	;;
 	brook)
@@ -367,7 +373,7 @@ run_socks() {
 		ln_start_bin "$(first_type $(config_t_get global_app brook_file notset) brook)" "brook_SOCKS_$5" "$protocol" --socks5 "$bind:$local_port" -s "$server_host:$port" -p "$(config_n_get $node password)"
 	;;
 	ss|ssr)
-		lua $API_GEN_SS $node $local_port > $config_file
+		lua $API_GEN_SS $node $local_port $server_host $port > $config_file
 		ln_start_bin "$(first_type ${type}-local)" "${type}-local" -c "$config_file" -b "$bind" -u
 	;;
 	esac
@@ -438,16 +444,32 @@ run_redir() {
 		esac
 	;;
 	TCP)
+		local kcptun_use=$(config_n_get $node use_kcp 0)
+		if [ "$kcptun_use" == "1" ]; then
+			local kcptun_server_host=$(config_n_get $node kcp_server)
+			local network_type="ipv4"
+			local kcptun_port=$(config_n_get $node kcp_port)
+			local kcptun_config="$(config_n_get $node kcp_opts)"
+			if [ -z "$kcptun_port" -o -z "$kcptun_config" ]; then
+				echolog "Kcptun未配置参数，错误！"
+				return 1
+			fi
+			if [ -n "$kcptun_port" -a -n "$kcptun_config" ]; then
+				local run_kcptun_ip=$server_host
+				[ -n "$kcptun_server_host" ] && run_kcptun_ip=$(get_host_ip $network_type $kcptun_server_host)
+				KCPTUN_REDIR_PORT=$(get_new_port $KCPTUN_REDIR_PORT tcp)
+				kcptun_params="-l 0.0.0.0:$KCPTUN_REDIR_PORT -r $run_kcptun_ip:$kcptun_port $kcptun_config"
+				ln_start_bin "$(first_type $(config_t_get global_app kcptun_client_file notset) kcptun-client)" "kcptun_tcp_$6" $kcptun_params
+			fi
+		fi
+		local _socks_flag _socks_address _socks_port _socks_username _socks_password
 		case "$type" in
 		socks)
-			local node_address=$(config_n_get $node address)
-			local node_port=$(config_n_get $node port)
-			local server_username=$(config_n_get $node username)
-			local server_password=$(config_n_get $node password)
-			eval port=\$TCP_REDIR_PORT$6
-			local extra_param="-T"
-			[ "$6" == 1 ] && [ "$UDP_NODE1" == "tcp" ] && extra_param=""
-			ln_start_bin "$(first_type ipt2socks)" "ipt2socks_tcp_$6" -l "$port" -b 0.0.0.0 -s "$node_address" -p "$node_port" -R $extra_param
+			_socks_flag=1
+			_socks_address=$(config_n_get $node address)
+			_socks_port=$(config_n_get $node port)
+			_socks_username=$(config_n_get $node username)
+			_socks_password=$(config_n_get $node password)
 		;;
 		v2ray)
 			local extra_param="tcp"
@@ -470,65 +492,46 @@ run_redir() {
 			ln_start_bin "$(first_type naive)" naive "$config_file"
 		;;
 		brook)
+			local server_ip=$server_host
 			local protocol=$(config_n_get $node protocol client)
+			local brook_tls=$(config_n_get $node brook_tls 0)
 			if [ "$protocol" == "wsclient" ]; then
-				echolog "Brook的WebSocket不支持UDP转发！"
+				[ "$brook_tls" == "1" ] && server_ip="wss://${server_ip}" || server_ip="ws://${server_ip}" 
+				socks_port=$(get_new_port 2081 tcp)
+				ln_start_bin "$(first_type $(config_t_get global_app brook_file notset) brook)" "brook_tcp_$6" wsclient --socks5 "127.0.0.1:$socks_port" -s "$server_ip:$port" -p "$(config_n_get $node password)"
+				_socks_flag=1
+				_socks_address="127.0.0.1"
+				_socks_port=$socks_port
+				echolog "Brook的WebSocket不支持透明代理，将使用ipt2socks转换透明代理！"
+				[ "$6" == 1 ] && [ "$UDP_NODE1" == "tcp" ] && echolog "Brook的WebSocket不支持UDP转发！"
 			else
-				ln_start_bin "$(first_type $(config_t_get global_app brook_file notset) brook)" "brook_udp_$6" tproxy -l ":$local_port" -s "$server_host:$port" -p "$(config_n_get $node password)"
+				[ "$kcptun_use" == "1" ] && {
+					server_ip=127.0.0.1
+					port=$KCPTUN_REDIR_PORT
+				}
+				ln_start_bin "$(first_type $(config_t_get global_app brook_file notset) brook)" "brook_tcp_$6" tproxy -l ":$local_port" -s "$server_ip:$port" -p "$(config_n_get $node password)"
 			fi
 		;;
-		*)
-			local kcptun_use=$(config_n_get $node use_kcp 0)
+		ss|ssr)
 			if [ "$kcptun_use" == "1" ]; then
-				local kcptun_server_host=$(config_n_get $node kcp_server)
-				local network_type="ipv4"
-				local kcptun_port=$(config_n_get $node kcp_port)
-				local kcptun_config="$(config_n_get $node kcp_opts)"
-				if [ -z "$kcptun_port" -o -z "$kcptun_config" ]; then
-					echolog "Kcptun未配置参数，错误！"
-					force_stop
-				fi
-				if [ -n "$kcptun_port" -a -n "$kcptun_config" ]; then
-					local run_kcptun_ip=$server_host
-					[ -n "$kcptun_server_host" ] && run_kcptun_ip=$(get_host_ip $network_type $kcptun_server_host)
-					KCPTUN_REDIR_PORT=$(get_new_port $KCPTUN_REDIR_PORT tcp)
-					kcptun_params="-l 0.0.0.0:$KCPTUN_REDIR_PORT -r $run_kcptun_ip:$kcptun_port $kcptun_config"
-					ln_start_bin "$(first_type $(config_t_get global_app kcptun_client_file notset) kcptun-client)" "kcptun_tcp_$6" $kcptun_params
-				fi
+				lua $API_GEN_SS $node $local_port 127.0.0.1 $KCPTUN_REDIR_PORT > $config_file
+				process=1
+				[ "$6" == 1 ] && [ "$UDP_NODE1" == "tcp" ] && echolog "Kcptun不支持UDP转发！"
+			else
+				lua $API_GEN_SS $node $local_port > $config_file
+				[ "$6" == 1 ] && [ "$UDP_NODE1" == "tcp" ] && extra_param="-u"
 			fi
-			if [ "$type" == "ssr" ] || [ "$type" == "ss" ]; then
-				if [ "$kcptun_use" == "1" ]; then
-					lua $API_GEN_SS $node $local_port 127.0.0.1 $KCPTUN_REDIR_PORT > $config_file
-					[ "$6" == 1 ] && [ "$UDP_NODE1" == "tcp" ] && echolog "Kcptun不支持UDP转发！"
-				else
-					lua $API_GEN_SS $node $local_port > $config_file
-					[ "$6" == 1 ] && [ "$UDP_NODE1" == "tcp" ] && extra_param="-u"
-				fi
-				for k in $(seq 1 $process); do
-					ln_start_bin "$(first_type ${type}-redir)" "${type}-redir" -c "$config_file" $extra_param
-				done
-			elif [ "$type" == "brook" ]; then
-				local server_ip=$server_host
-				local protocol=$(config_n_get $node protocol client)
-				local brook_tls=$(config_n_get $node brook_tls 0)
-				if [ "$protocol" == "wsclient" ]; then
-					[ "$brook_tls" == "1" ] && server_ip="wss://${server_ip}" || server_ip="ws://${server_ip}" 
-					socks_port=$(get_new_port 2081 tcp)
-					ln_start_bin "$(first_type $(config_t_get global_app brook_file notset) brook)" "brook_tcp_$6" wsclient --socks5 "127.0.0.1:$socks_port" -s "$server_ip:$port" -p "$(config_n_get $node password)"
-					eval port=\$TCP_REDIR_PORT$6
-					ln_start_bin "$(first_type ipt2socks)" "ipt2socks_tcp_$6" -T -l "$port" -b 0.0.0.0 -s 127.0.0.1 -p "$socks_port" -R
-					echolog "Brook的WebSocket不支持透明代理，将使用ipt2socks转换透明代理！"
-					[ "$6" == 1 ] && [ "$UDP_NODE1" == "tcp" ] && echolog "Brook的WebSocket不支持UDP转发！"
-				else
-					[ "$kcptun_use" == "1" ] && {
-						server_ip=127.0.0.1
-						port=$KCPTUN_REDIR_PORT
-					}
-					ln_start_bin "$(first_type $(config_t_get global_app brook_file notset) brook)" "brook_tcp_$6" tproxy -l ":$local_port" -s "$server_ip:$port" -p "$(config_n_get $node password)"
-				fi
-			fi
+			for k in $(seq 1 $process); do
+				ln_start_bin "$(first_type ${type}-redir)" "${type}-redir" -c "$config_file" $extra_param
+			done
 		;;
 		esac
+		if [ -n "$_socks_flag" ]; then
+			local extra_param="-T"
+			[ "$6" == 1 ] && [ "$UDP_NODE1" == "tcp" ] && extra_param=""
+			ln_start_bin "$(first_type ipt2socks)" "ipt2socks_tcp_$6" -l "$local_port" -b 0.0.0.0 -s "$_socks_address" -p "$_socks_port" -R $extra_param
+		fi
+		unset _socks_flag _socks_address _socks_port _socks_username _socks_password
 	;;
 	esac
 	return 0
@@ -743,7 +746,7 @@ start_dns() {
 		TUN_DNS=""
 	;;
 	dns2socks)
-		echolog "  - 域名解析 dns2socks..."
+		echolog "  - 域名解析：dns2socks..."
 	;;
 	https-dns-proxy)
 		up_trust_doh_dns=$(config_t_get global up_trust_doh_dns "tcp")
@@ -768,13 +771,14 @@ start_dns() {
 	;;
 	udp)
 		use_udp_node_resolve_dns=1
-		msg="直接使用UDP节点请求DNS"
+		TUN_DNS=${DNS_FORWARD}
+		echolog "  - 域名解析：直接使用UDP节点请求DNS（$TUN_DNS）"
 	;;
 	custom)
 		[ "$CHINADNS_NG" != "1" ] && {
 			custom_dns=$(config_t_get global custom_dns)
 			TUN_DNS="$(echo ${custom_dns} | sed 's/:/#/g')"
-			echolog "  - 域名解析 直接使用UDP协议自定义DNS（$TUN_DNS）解析..."
+			echolog "  - 域名解析：直接使用UDP协议自定义DNS（$TUN_DNS）解析..."
 		}
 	;;
 	esac
@@ -812,8 +816,8 @@ start_dns() {
 		echolog "  - dns2sock(127.0.0.1:${dns_listen_port}${dns2sock_cache})，${dns2socks_socks_server:-127.0.0.1:9050} -> ${dns2socks_forward-D46.182.19.48:53}"
 		#[ "$CHINADNS_NG" = "1" ] && [ -n "${global}${chnlist}" ] && [ -z "${returnhome}" ] && TUN_DNS=$(echo "${dns_listen_port}" | sed 's/:/#/g')
 	fi
-	[ "${use_udp_node_resolve_dns}" = "1" ] && echolog "  * 要求代理 DNS 请求，如上游 DNS 非直连地址，确保 UDP 代理打开，并且已经正确转发"
-	[ "${use_tcp_node_resolve_dns}" = "1" ] && echolog "  * 请确认上游 DNS 支持 TCP 查询，如非直连地址，确保 TCP 代理打开，并且已经正确转发"
+	[ "${use_udp_node_resolve_dns}" = "1" ] && echolog "  * 要求代理 DNS 请求，如上游 DNS 非直连地址，确保 UDP 代理打开，并且已经正确转发！"
+	[ "${use_tcp_node_resolve_dns}" = "1" ] && echolog "  * 请确认上游 DNS 支持 TCP 查询，如非直连地址，确保 TCP 代理打开，并且已经正确转发！"
 }
 
 add_dnsmasq() {
@@ -843,9 +847,9 @@ add_dnsmasq() {
 		hosts_foreach "servers" host_from_url | grep -v "google.c" | grep '[a-zA-Z]$' | sort -u | gen_dnsmasq_items "vpsiplist" "${fwd_dns}" "${TMP_DNSMASQ_PATH}/01-vpsiplist_host.conf"
 		echolog "  - [$?]节点列表中的域名(vpsiplist)：${fwd_dns:-默认}"
 
-		#始终用国内DNS解析直连（白名单）列表		
+		#始终用国内DNS解析直连（白名单）列表
 		fwd_dns="${LOCAL_DNS}"
-		#如果使用Chinadns-NG直接交给Chinadns-NG处理
+		#如果使用ChinaDNS-NG则直接交给它处理
 		[ "$CHINADNS_NG" = "1" ] && unset fwd_dns
 		#如果没使用chnlist直接使用默认DNS
 		[ "${USE_CHNLIST}" = "0" ] && unset fwd_dns
@@ -857,18 +861,28 @@ add_dnsmasq() {
 			fwd_dns="${LOCAL_DNS}"
 			[ -n "${returnhome}" ] || [ -n "${chnlist}" ] && {
 				[ -n "${global}" ] && unset fwd_dns
-				#如果使用Chinadns-NG直接交给Chinadns-NG处理
+				#如果使用Chinadns-NG直接交给它处理
 				[ "$CHINADNS_NG" = "1" ] && unset fwd_dns
-				#如果使用回国模式，设置dns为远程DNS。
+				#如果使用回国模式，设置DNS为远程DNS。
 				[ -n "${returnhome}" ] && fwd_dns="${TUN_DNS}"
 				sort -u "${RULES_PATH}/chnlist" | gen_dnsmasq_items "chnroute" "${fwd_dns}" "${TMP_DNSMASQ_PATH}/chinalist_host.conf"
 				echolog "  - [$?]中国域名表(chnroute)：${fwd_dns:-默认}"
 			}
 		}
+		
+		#分流规则
+		fwd_dns="${TUN_DNS}"
+		#如果使用chnlist直接使用默认DNS
+		[ "${USE_CHNLIST}" = "1" ] && unset fwd_dns
+		local shunt_ids=$(uci show $CONFIG | grep "=shunt_rules" | awk -F '.' '{print $2}' | awk -F '=' '{print $1}')
+		for shunt_id in $shunt_ids; do
+			config_n_get $shunt_id domain_list | tr -s "\r\n" "\n" | gen_dnsmasq_items "shuntlist" "${fwd_dns}" "${TMP_DNSMASQ_PATH}/shunt_host.conf"
+			echolog "  - [$?]$shunt_id分流规则(shuntlist)：${fwd_dns:-默认}"
+		done
 
 		#始终使用远程DNS解析代理（黑名单）列表
 		fwd_dns="${TUN_DNS}"
-		#如果使用Chinadns-NG直接交给Chinadns-NG处理
+		#如果使用Chinadns-NG直接交给它处理
 		[ "$CHINADNS_NG" = "1" ] && unset fwd_dns
 		#如果使用chnlist直接使用默认DNS
 		[ "${USE_CHNLIST}" = "1" ] && unset fwd_dns
@@ -880,7 +894,7 @@ add_dnsmasq() {
 		#如果没有使用回国模式
 		[ -z "${returnhome}" ] && {
 			fwd_dns="${TUN_DNS}"
-			#如果使用Chinadns-NG直接交给Chinadns-NG处理
+			#如果使用Chinadns-NG直接交给它处理
 			[ "$CHINADNS_NG" = "1" ] && unset fwd_dns
 			#如果使用chnlist直接使用默认DNS
 			[ "${USE_CHNLIST}" = "1" ] && unset fwd_dns
@@ -892,7 +906,7 @@ add_dnsmasq() {
 		#如果开启了通过代理订阅
 		[ "$(config_t_get global_subscribe subscribe_proxy 0)" = "1" ] && {
 			fwd_dns="${TUN_DNS}"
-			#如果使用Chinadns-NG直接交给Chinadns-NG处理
+			#如果使用Chinadns-NG直接交给它处理
 			[ "$CHINADNS_NG" = "1" ] && unset fwd_dns
 			#如果使用chnlist直接使用默认DNS
 			[ "${USE_CHNLIST}" = "1" ] && unset fwd_dns
@@ -911,7 +925,7 @@ add_dnsmasq() {
 		#兼容旧版dnsmasq
 		echo "conf-dir=${TMP_DNSMASQ_PATH}" > "${DNSMASQ_PATH}/dnsmasq-${CONFIG}.conf"
 
-		[ "${USE_CHNLIST}" = "1" ] && servers="${TUN_DNS}"
+		[ "${USE_CHNLIST}" = "1" ] && [ -z "${returnhome}" ] && [ -n "${chnlist}" ] && servers="${TUN_DNS}"
 		[ -n "${chnlist}" ] && msg="中国列表以外"
 		[ -n "${returnhome}" ] && msg="中国列表"
 		[ -n "${global}" ] && msg="全局"
@@ -1186,21 +1200,23 @@ stop() {
 	echolog "清空并关闭相关程序和缓存完成。"
 }
 
-case $1 in
+arg1=$1
+shift
+case $arg1 in
 get_new_port)
-	get_new_port $2 $3
+	get_new_port $@
 	;;
 run_socks)
-	run_socks $2 $3 $4 $5 $6
+	run_socks $@
 	;;
 run_redir)
-	run_redir $2 $3 $4 $5 $6 $7
+	run_redir $@
 	;;
 node_switch)
-	node_switch $2 $3 $4 $5
+	node_switch $@
 	;;
 stop)
-	[ "$2" = "force" ] && force_stop
+	[ "$1" = "force" ] && force_stop
 	stop
 	;;
 start)
